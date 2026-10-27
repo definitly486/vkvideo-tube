@@ -132,7 +132,9 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            prerelease=()
+            case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" "${prerelease[@]}" \
               --verify-tag \
               --generate-notes \
               --title "0W-Tube ${GITHUB_REF_NAME}"

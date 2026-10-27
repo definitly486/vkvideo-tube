@@ -30,6 +30,8 @@ import android.widget.ImageView;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
+import android.widget.Toast;
 import android.widget.TextView;
 
 import androidx.core.content.FileProvider;
@@ -99,6 +101,19 @@ public final class MainActivity extends Activity {
     private String currentSearchQuery = "";
     private int qualityJobs;
     private boolean historyMode;
+    private boolean channelsMode;
+    private boolean channelOpen;
+    private Channels.Bookmark currentChannel;
+    private final ExecutorService channelIo = Executors.newSingleThreadExecutor();
+    private final AtomicInteger channelGeneration = new AtomicInteger();
+    private static final ExpiringCache<String, List<VideoItem>> CHANNEL_CACHE =
+            new ExpiringCache<>(8, 5 * 60 * 1000L);
+    private final List<Button> tabButtons = new ArrayList<>();
+    private View tabBar;
+    private View channelsBar;
+    private View channelList;
+    private TextView channelsTitle;
+    private TextView channelsStatus;
     private int modeSwitchHeldKey = KeyEvent.KEYCODE_UNKNOWN;
     private final GridState searchGridState = new GridState();
     private final GridState historyGridState = new GridState();
@@ -186,8 +201,45 @@ public final class MainActivity extends Activity {
             bar.addView(search, searchParams);
         }
 
+        root.addView(createTabBar(), new LinearLayout.LayoutParams(-1, dp(compact ? 40 : 44)));
+
         searchBar = bar;
         root.addView(searchBar, new LinearLayout.LayoutParams(-1, dp(compact ? 48 : 64)));
+
+        LinearLayout channelsHeader = new LinearLayout(this);
+        channelsHeader.setGravity(Gravity.CENTER_VERTICAL);
+        channelsTitle = text("Каналы", compact ? 18 : 22, Color.WHITE);
+        channelsTitle.setGravity(Gravity.CENTER_VERTICAL);
+        channelsTitle.setPadding(dp(compact ? 4 : 12), 0, 0, 0);
+        channelsHeader.addView(channelsTitle, new LinearLayout.LayoutParams(0, -1, 1f));
+        channelsStatus = text("", compact ? 11 : 13, Color.rgb(169, 176, 190));
+        channelsStatus.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        channelsHeader.addView(channelsStatus,
+                new LinearLayout.LayoutParams(dp(compact ? 78 : 120), -1));
+        channelsBar = channelsHeader;
+        root.addView(channelsBar, new LinearLayout.LayoutParams(-1, dp(compact ? 44 : 56)));
+
+        ScrollView channelScroll = new ScrollView(this);
+        LinearLayout channelRows = new LinearLayout(this);
+        channelRows.setOrientation(LinearLayout.VERTICAL);
+        channelRows.setPadding(0, dp(4), 0, dp(20));
+        for (Channels.Bookmark bookmark : Channels.ALL) {
+            Button row = new Button(this);
+            row.setText("★  " + bookmark.title + "\nVK Video");
+            row.setTextColor(Color.WHITE);
+            row.setTextSize(compact ? 16 : 18);
+            row.setAllCaps(false);
+            row.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(18), dp(8), dp(18), dp(8));
+            row.setBackgroundResource(R.drawable.filter_chip_background);
+            row.setOnClickListener(v -> openChannel(bookmark));
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, dp(compact ? 64 : 72));
+            rowParams.setMargins(0, 0, 0, dp(10));
+            channelRows.addView(row, rowParams);
+        }
+        channelScroll.addView(channelRows, new ScrollView.LayoutParams(-1, -2));
+        channelList = channelScroll;
+        root.addView(channelList, new LinearLayout.LayoutParams(-1, 0, 1f));
 
         LinearLayout historyHeader = new LinearLayout(this);
         historyHeader.setGravity(Gravity.CENTER_VERTICAL);
@@ -292,7 +344,7 @@ public final class MainActivity extends Activity {
 
                     @Override public boolean onFling(MotionEvent start, MotionEvent end,
                                                      float velocityX, float velocityY) {
-                        if (DeviceType.isTelevision(MainActivity.this)
+                        if (DeviceType.isTelevision(MainActivity.this) || channelsMode
                                 || start == null || end == null) return false;
                         float dx = end.getX() - start.getX();
                         float dy = end.getY() - start.getY();
@@ -329,9 +381,126 @@ public final class MainActivity extends Activity {
         thumbnailTargetWidth = Math.max(1, columnWidth - dp(14));
     }
 
+    private View createTabBar() {
+        tabButtons.clear();
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setGravity(Gravity.CENTER_VERTICAL);
+        String[] labels = {"Поиск", "История", "Каналы"};
+        for (int i = 0; i < labels.length; i++) {
+            final int index = i;
+            Button tab = new Button(this);
+            tab.setText(labels[i]);
+            tab.setTextColor(Color.WHITE);
+            tab.setTextSize(13);
+            tab.setAllCaps(false);
+            tab.setPadding(dp(14), 0, dp(14), 0);
+            tab.setBackgroundResource(R.drawable.filter_chip_background);
+            tab.setOnClickListener(v -> onTabClicked(index));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, dp(30));
+            params.setMargins(0, 0, dp(10), 0);
+            tabs.addView(tab, params);
+            tabButtons.add(tab);
+        }
+        tabBar = tabs;
+        return tabs;
+    }
+
+    private void onTabClicked(int index) {
+        if (index == 0) showSearch(true);
+        else if (index == 1) showHistory(true);
+        else if (channelsMode && channelOpen) closeChannel();
+        else showChannels();
+    }
+
+    private void showChannels() {
+        if (channelsMode) return;
+        if (historyMode) captureGridState(historyGridState); else captureGridState(searchGridState);
+        historyMode = false;
+        channelsMode = true;
+        channelOpen = false;
+        currentChannel = null;
+        StateStore.markChannels(this, "");
+        hideKeyboard();
+        items.clear();
+        adapter.notifyDataSetChanged();
+        updateModeChrome();
+        if (channelList != null) channelList.post(() -> {
+            if (channelsMode && !channelOpen && channelList instanceof ScrollView) {
+                View rows = ((ScrollView) channelList).getChildAt(0);
+                if (rows instanceof ViewGroup && ((ViewGroup) rows).getChildCount() > 0) {
+                    ((ViewGroup) rows).getChildAt(0).requestFocus();
+                }
+            }
+        });
+    }
+
+    private void openChannel(Channels.Bookmark bookmark) {
+        channelOpen = true;
+        currentChannel = bookmark;
+        StateStore.markChannels(this, bookmark.url);
+        int current = channelGeneration.incrementAndGet();
+        items.clear();
+        List<VideoItem> cached = CHANNEL_CACHE.get(bookmark.url);
+        if (cached != null) items.addAll(cached);
+        adapter.notifyDataSetChanged();
+        updateModeChrome();
+        if (cached != null) {
+            grid.post(() -> { grid.setSelection(0); grid.requestFocus(); });
+            return;
+        }
+        channelsStatus.setText("…");
+        channelIo.execute(() -> {
+            try {
+                List<VideoItem> found = new VkWebClient().channelVideos(bookmark.handle,
+                        thumbnailTargetWidth);
+                CHANNEL_CACHE.put(bookmark.url, found);
+                runOnUiThread(() -> {
+                    if (current != channelGeneration.get() || !channelsMode || !channelOpen
+                            || isFinishing()) return;
+                    items.clear();
+                    items.addAll(found);
+                    adapter.notifyDataSetChanged();
+                    updateModeChrome();
+                    if (!items.isEmpty()) { grid.setSelection(0); grid.requestFocus(); }
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (current != channelGeneration.get() || !channelsMode || isFinishing()) return;
+                    channelsStatus.setText("Ошибка");
+                    Toast.makeText(this, safeMessage(error), Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    private void closeChannel() {
+        if (!channelsMode || !channelOpen) return;
+        channelGeneration.incrementAndGet();
+        channelOpen = false;
+        currentChannel = null;
+        StateStore.markChannels(this, "");
+        items.clear();
+        adapter.notifyDataSetChanged();
+        updateModeChrome();
+        if (channelList != null) channelList.post(() -> {
+            View rows = ((ScrollView) channelList).getChildAt(0);
+            if (rows instanceof ViewGroup && ((ViewGroup) rows).getChildCount() > 0) {
+                ((ViewGroup) rows).getChildAt(0).requestFocus();
+            }
+        });
+    }
+
     private void showHistory(boolean focusGrid) {
         if (historyMode) return;
-        captureGridState(searchGridState);
+        if (channelsMode) {
+            channelGeneration.incrementAndGet();
+            channelsMode = false;
+            channelOpen = false;
+            currentChannel = null;
+        } else {
+            captureGridState(searchGridState);
+        }
         historyMode = true;
         StateStore.markHistory(this);
         items.clear();
@@ -343,9 +512,13 @@ public final class MainActivity extends Activity {
     }
 
     private void showSearch(boolean focusGrid) {
-        if (!historyMode) return;
-        captureGridState(historyGridState);
+        if (!historyMode && !channelsMode) return;
+        if (historyMode) captureGridState(historyGridState);
+        channelGeneration.incrementAndGet();
         historyMode = false;
+        channelsMode = false;
+        channelOpen = false;
+        currentChannel = null;
         StateStore.markSearch(this);
         items.clear();
         items.addAll(searchItems);
@@ -387,9 +560,25 @@ public final class MainActivity extends Activity {
 
     private void updateModeChrome() {
         if (searchBar == null || filterBar == null || historyBar == null) return;
-        searchBar.setVisibility(historyMode ? View.GONE : View.VISIBLE);
-        filterBar.setVisibility(historyMode ? View.GONE : View.VISIBLE);
+        boolean searchScreen = !historyMode && !channelsMode;
+        searchBar.setVisibility(searchScreen ? View.VISIBLE : View.GONE);
+        filterBar.setVisibility(searchScreen ? View.VISIBLE : View.GONE);
         historyBar.setVisibility(historyMode ? View.VISIBLE : View.GONE);
+        if (channelsBar != null) channelsBar.setVisibility(channelsMode ? View.VISIBLE : View.GONE);
+        if (channelList != null) {
+            channelList.setVisibility(channelsMode && !channelOpen ? View.VISIBLE : View.GONE);
+        }
+        if (grid != null) grid.setVisibility(channelsMode && !channelOpen ? View.GONE : View.VISIBLE);
+        if (channelsTitle != null) {
+            channelsTitle.setText(channelOpen && currentChannel != null
+                    ? currentChannel.title : "Каналы");
+        }
+        if (channelsStatus != null && channelsMode) {
+            channelsStatus.setText(channelOpen && !items.isEmpty() ? String.valueOf(items.size()) : "");
+        }
+        for (int i = 0; i < tabButtons.size(); i++) {
+            tabButtons.get(i).setSelected(i == (channelsMode ? 2 : historyMode ? 1 : 0));
+        }
         if (historyStatus != null && historyMode) {
             historyStatus.setText(items.isEmpty() ? "Пусто" : String.valueOf(items.size()));
         }
@@ -437,12 +626,16 @@ public final class MainActivity extends Activity {
         network.purge();
         allItems.clear();
         searchItems.clear();
-        if (!historyMode) items.clear();
+        boolean searchScreen = !historyMode && !channelsMode;
+        if (searchScreen) items.clear();
         qualityRequested.clear();
         qualityJobs = 0;
-        if (!historyMode) adapter.notifyDataSetChanged();
+        if (searchScreen) adapter.notifyDataSetChanged();
         StateStore.saveSearch(this, value, selectedFilter, trafficMode);
         if (historyMode) StateStore.markHistory(this);
+        else if (channelsMode) {
+            StateStore.markChannels(this, channelOpen && currentChannel != null ? currentChannel.url : "");
+        }
         rutubeDone = false;
         vkDone = false;
         dzenDone = false;
@@ -594,15 +787,15 @@ public final class MainActivity extends Activity {
 
     private void refreshDisplayedItems(boolean selectFirst) {
         boolean hadItems = !searchItems.isEmpty();
-        boolean gridHadFocus = !historyMode && grid.hasFocus();
-        String selectedKey = historyMode ? searchGridState.selectedKey : selectedItemKey();
+        boolean gridHadFocus = !historyMode && !channelsMode && grid.hasFocus();
+        String selectedKey = historyMode || channelsMode ? searchGridState.selectedKey : selectedItemKey();
         int minWidth = trafficMode ? TRAFFIC_FILTER_WIDTHS[selectedFilter] : NORMAL_FILTER_WIDTHS[selectedFilter];
         searchItems.clear();
         for (VideoItem item : allItems) {
             if (minWidth == 0 || item.maxWidth >= minWidth) searchItems.add(item);
         }
         Collections.sort(searchItems, VideoRanker.comparator(currentSearchQuery, trafficMode));
-        if (historyMode) {
+        if (historyMode || channelsMode) {
             updateSearchStatus();
             return;
         }
@@ -709,6 +902,7 @@ public final class MainActivity extends Activity {
         }
         StateStore.savePlayer(this, item, position, playerTrafficMode, targetHeight,
                 audioOnly, historyMode);
+        if (channelsMode) StateStore.setReturnScreen(this, "channels");
         launchPlayer(item, position, true, playerTrafficMode, targetHeight, audioOnly);
     }
 
@@ -763,6 +957,13 @@ public final class MainActivity extends Activity {
             showHistory(false);
             return;
         }
+        if ("channels".equals(screen)) {
+            String openUrl = StateStore.openChannel(this);
+            showChannels();
+            Channels.Bookmark reopen = Channels.byUrl(openUrl);
+            if (reopen != null) openChannel(reopen);
+            return;
+        }
         if (lastQuery.trim().length() >= 2) grid.post(this::search); else query.requestFocus();
     }
 
@@ -776,7 +977,7 @@ public final class MainActivity extends Activity {
                 return true;
             }
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                boolean longOpen = !historyMode
+                boolean longOpen = !historyMode && !channelsMode
                         && keyCode == KeyEvent.KEYCODE_DPAD_DOWN
                         && event.getRepeatCount() > 0;
                 int selected = grid == null ? -1 : grid.getSelectedItemPosition();
@@ -803,6 +1004,10 @@ public final class MainActivity extends Activity {
     }
 
     private boolean handleBackNavigation() {
+        if (channelsMode) {
+            if (channelOpen) closeChannel(); else showSearch(true);
+            return true;
+        }
         if (!historyMode) return false;
         showSearch(true);
         return true;
@@ -845,7 +1050,7 @@ public final class MainActivity extends Activity {
         updateSearchStatus();
 
         if (items.isEmpty()) {
-            if (queryHadFocus && !historyMode) query.requestFocus();
+            if (queryHadFocus && !historyMode && !channelsMode) query.requestFocus();
         } else {
             final int visiblePosition = Math.max(0, Math.min(firstVisible, items.size() - 1));
             grid.setSelectionFromTop(visiblePosition, firstTop);
@@ -867,6 +1072,8 @@ public final class MainActivity extends Activity {
         unregisterSystemBackCallback();
         generation.incrementAndGet();
         historyGeneration.incrementAndGet();
+        channelGeneration.incrementAndGet();
+        channelIo.shutdownNow();
         for (Future<?> search : activeSearches) search.cancel(true);
         activeSearches.clear();
         network.shutdownNow();
@@ -886,7 +1093,8 @@ public final class MainActivity extends Activity {
         }
         String savedScreen = StateStore.screen(this);
         if ("history".equals(savedScreen) && !historyMode) showHistory(true);
-        else if ("search".equals(savedScreen) && historyMode) showSearch(true);
+        else if ("search".equals(savedScreen) && (historyMode || channelsMode)) showSearch(true);
+        else if ("channels".equals(savedScreen) && !channelsMode) showChannels();
         if (historyMode) reloadHistory(true, historyGridState.hadFocus);
         if (adapter != null) adapter.notifyDataSetChanged();
         if (grid != null) grid.post(() -> {

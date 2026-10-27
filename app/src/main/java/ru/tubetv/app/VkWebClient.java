@@ -19,6 +19,7 @@ import java.util.Set;
 final class VkWebClient {
     private static final int LIMIT = 12;
     private static final int MAX_PAGES = 4;
+    private static final int CHANNEL_LIMIT = 30;
     private static final int TIMEOUT_MS = 10_000;
     private static final String CLIENT_ID = "52461373";
     private static final String API_VERSION = "5.282";
@@ -155,12 +156,7 @@ final class VkWebClient {
         for (String id : orderedIds) {
             JSONObject video = videos.get(id);
             if (video == null || !seen.add(id)) continue;
-            String page = "https://vkvideo.ru/video" + VkVideoId.fromVideo(video);
-            VideoItem item = new VideoItem("VK VIDEO", video.optString("title", "Видео VK"),
-                    "", bestImage(video.optJSONArray("image"), thumbnailWidth), page, page,
-                    video.optLong("duration") * 1000L);
-            int[] dimensions = maxAvailableDimensions(video);
-            result.add(item.withQuality(dimensions[0], dimensions[1]));
+            result.add(itemFromVideo(video, thumbnailWidth));
             if (result.size() >= limit) break;
         }
         return result;
@@ -277,6 +273,124 @@ final class VkWebClient {
             }
         }
         return smallestSuitable.isEmpty() ? largestFallback : smallestSuitable;
+    }
+
+    private static VideoItem itemFromVideo(JSONObject video, int thumbnailWidth) {
+        String page = "https://vkvideo.ru/video" + VkVideoId.fromVideo(video);
+        String thumbnail = bestImage(video.optJSONArray("image"), thumbnailWidth);
+        if (thumbnail.isEmpty()) {
+            thumbnail = video.optString("photo_800", video.optString("photo_320", ""));
+        }
+        VideoItem item = new VideoItem("VK VIDEO", video.optString("title", "Видео VK"),
+                "", thumbnail, page, page, video.optLong("duration") * 1000L);
+        int[] dimensions = maxAvailableDimensions(video);
+        return item.withQuality(dimensions[0], dimensions[1]);
+    }
+
+    /**
+     * Videos of a public VK Video channel such as https://vkvideo.ru/@be_on_edge.
+     * First the anonymous API is asked for the owner's video list; if that is refused,
+     * the public channel page is scanned for video IDs, which are then resolved through
+     * video.getByIds exactly like a single video.
+     */
+    List<VideoItem> channelVideos(String handle, int thumbnailWidth) throws Exception {
+        Exception apiError = null;
+        try {
+            Long ownerId = resolveOwnerId(handle);
+            if (ownerId != null) {
+                List<VideoItem> videos = ownerVideos(ownerId, thumbnailWidth);
+                if (!videos.isEmpty()) return videos;
+            }
+        } catch (Exception e) {
+            if (Thread.currentThread().isInterrupted()) throw e;
+            apiError = e;
+        }
+        try {
+            List<VideoItem> videos = pageVideos(handle, thumbnailWidth);
+            if (!videos.isEmpty()) return videos;
+        } catch (Exception e) {
+            if (Thread.currentThread().isInterrupted()) throw e;
+            if (apiError == null) apiError = e;
+        }
+        throw new Exception("Не удалось загрузить канал @" + handle
+                + (apiError == null || apiError.getMessage() == null
+                ? "" : ": " + apiError.getMessage()));
+    }
+
+    private static Long resolveOwnerId(String handle) throws Exception {
+        JSONObject root = authorizedJson("https://api.vkvideo.ru/method/utils.resolveScreenName"
+                + "?v=" + API_VERSION + "&client_id=" + CLIENT_ID
+                + "&screen_name=" + Uri.encode(handle), null);
+        JSONObject response = response(root);
+        long objectId = response.optLong("object_id");
+        if (objectId <= 0) return null;
+        String type = response.optString("type");
+        return "user".equals(type) ? objectId : -objectId;
+    }
+
+    private static List<VideoItem> ownerVideos(long ownerId, int thumbnailWidth) throws Exception {
+        JSONObject root = authorizedJson("https://api.vkvideo.ru/method/video.get"
+                + "?v=" + API_VERSION + "&client_id=" + CLIENT_ID
+                + "&owner_id=" + ownerId + "&count=" + CHANNEL_LIMIT, null);
+        return parseVideoArray(response(root).optJSONArray("items"), thumbnailWidth);
+    }
+
+    private static List<VideoItem> pageVideos(String handle, int thumbnailWidth) throws Exception {
+        String html = getText("https://vkvideo.ru/@" + Uri.encode(handle));
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("video(-?\\d+)_(\\d+)").matcher(html);
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        java.util.HashMap<String, Integer> ownerCounts = new java.util.HashMap<>();
+        while (matcher.find() && ids.size() < CHANNEL_LIMIT * 4) {
+            if (ids.add(matcher.group(1) + "_" + matcher.group(2))) {
+                ownerCounts.merge(matcher.group(1), 1, Integer::sum);
+            }
+        }
+        // Related-video blocks belong to other owners; keep the channel's own videos.
+        String owner = null;
+        int best = 0;
+        for (java.util.Map.Entry<String, Integer> entry : ownerCounts.entrySet()) {
+            if (entry.getValue() > best) { best = entry.getValue(); owner = entry.getKey(); }
+        }
+        if (owner == null) return new ArrayList<>();
+        StringBuilder wanted = new StringBuilder();
+        int count = 0;
+        for (String id : ids) {
+            if (!id.startsWith(owner + "_") || count >= CHANNEL_LIMIT) continue;
+            if (count++ > 0) wanted.append(',');
+            wanted.append(id);
+        }
+        String address = "https://api.vkvideo.ru/method/video.getByIds"
+                + "?v=" + API_VERSION + "&client_id=" + CLIENT_ID;
+        JSONObject root = authorizedJson(address, "videos=" + Uri.encode(wanted.toString())
+                + "&video_fields=" + Uri.encode("files"));
+        JSONObject response = response(root);
+        return parseVideoArray(response.optJSONArray("items"), thumbnailWidth);
+    }
+
+    private static List<VideoItem> parseVideoArray(JSONArray array, int thumbnailWidth) {
+        List<VideoItem> result = new ArrayList<>();
+        if (array == null) return result;
+        Set<String> seen = new LinkedHashSet<>();
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject video = array.optJSONObject(i);
+            if (video == null || !seen.add(key(video))) continue;
+            result.add(itemFromVideo(video, thumbnailWidth));
+        }
+        return result;
+    }
+
+    private static String getText(String address) throws Exception {
+        BoundedHttpReader.checkInterrupted();
+        HttpURLConnection connection = configure((HttpURLConnection) new URL(address).openConnection());
+        connection.setRequestProperty("Accept", "text/html,*/*");
+        try {
+            int code = connection.getResponseCode();
+            if (code < 200 || code >= 300) throw new Exception("VK Video: HTTP " + code);
+            return BoundedHttpReader.readText(connection.getInputStream(), BoundedHttpReader.PAGE_LIMIT);
+        } finally {
+            connection.disconnect();
+        }
     }
 
     private static JSONObject getJson(String address) throws Exception {
