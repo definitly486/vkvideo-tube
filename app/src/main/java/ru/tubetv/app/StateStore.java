@@ -1,0 +1,98 @@
+package ru.tubetv.app;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+final class StateStore {
+    private static final String PREFS = "playback_state";
+
+    static void saveSearch(Context context, String query, int filter, boolean trafficMode) {
+        prefs(context).edit()
+                .putString("screen", "search")
+                .putString("query", query)
+                .putInt("filter", filter)
+                .putBoolean("traffic_mode", trafficMode)
+                .apply();
+    }
+
+    static void savePlayer(Context context, VideoItem item, long position,
+                           boolean trafficMode, int targetHeight, boolean audioOnly,
+                           boolean returnToHistory) {
+        prefs(context).edit()
+                .putString("screen", "player")
+                .putString("return_screen", returnToHistory ? "history" : "search")
+                .putString("source", item.source)
+                .putString("title", item.title)
+                .putString("subtitle", item.subtitle)
+                .putString("thumbnail", item.thumbnail)
+                .putString("resolver_url", item.playUrl)
+                .putString("page_url", item.pageUrl)
+                .putLong("duration", item.durationMs)
+                .putInt("max_width", item.maxWidth)
+                .putInt("max_height", item.maxHeight)
+                .putLong("position", Math.max(0, position))
+                .putBoolean("player_traffic_mode", trafficMode)
+                .putInt("player_target_height", targetHeight)
+                .putBoolean("player_audio_only", audioOnly)
+                .apply();
+    }
+
+    static void savePlayerPosition(Context context, String source, String pageUrl, long position) {
+        savePlayerPosition(prefs(context), source, pageUrl, position);
+    }
+
+    static void savePlayerPosition(SharedPreferences preferences, String source, String pageUrl, long position) {
+        if (!java.util.Objects.equals(source, preferences.getString("source", null))
+                || !java.util.Objects.equals(pageUrl, preferences.getString("page_url", null))) return;
+        preferences.edit().putLong("position", Math.max(0, position)).apply();
+    }
+
+    static void savePlaybackSpeed(Context context, float speed) {
+        prefs(context).edit().putFloat("playback_speed", speed).apply();
+    }
+
+    static void markSearch(Context context) {
+        prefs(context).edit().putString("screen", "search").apply();
+    }
+
+    static void markHistory(Context context) {
+        prefs(context).edit().putString("screen", "history").apply();
+    }
+
+    static void markReturnScreen(Context context) {
+        SharedPreferences preferences = prefs(context);
+        preferences.edit().putString("screen",
+                preferences.getString("return_screen", "search")).apply();
+    }
+
+    static String screen(Context context) { return prefs(context).getString("screen", "search"); }
+    static String query(Context context) { return prefs(context).getString("query", ""); }
+    static int filter(Context context) { return prefs(context).getInt("filter", 0); }
+    static boolean trafficMode(Context context) { return prefs(context).getBoolean("traffic_mode", false); }
+    static boolean playerTrafficMode(Context context) { return prefs(context).getBoolean("player_traffic_mode", false); }
+    static int playerTargetHeight(Context context) { return prefs(context).getInt("player_target_height", 0); }
+    static boolean playerAudioOnly(Context context) { return prefs(context).getBoolean("player_audio_only", false); }
+    static long position(Context context) { return prefs(context).getLong("position", 0L); }
+    static float playbackSpeed(Context context) { return prefs(context).getFloat("playback_speed", 1f); }
+
+    static VideoItem playerItem(Context context) {
+        SharedPreferences p = prefs(context);
+        String resolver = p.getString("resolver_url", "");
+        if (resolver == null || resolver.isEmpty()) return null;
+        return new VideoItem(
+                p.getString("source", "RUTUBE"),
+                p.getString("title", "Видео"),
+                p.getString("subtitle", ""),
+                p.getString("thumbnail", ""),
+                resolver,
+                p.getString("page_url", ""),
+                p.getLong("duration", 0L))
+                .withQuality(p.getInt("max_width", 0), p.getInt("max_height", 0));
+    }
+
+    private static SharedPreferences prefs(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    private StateStore() { }
+}

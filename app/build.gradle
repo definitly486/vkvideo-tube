@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseKeystorePath = System.getenv('RELEASE_KEYSTORE_PATH')
+
+android {
+    namespace = 'ru.tubetv.app'
+    compileSdk 36
+
+    buildFeatures { buildConfig = true }
+
+    defaultConfig {
+        applicationId 'ru.tubetv.app'
+        minSdk 23
+        targetSdk 35
+        versionCode 33
+        versionName '0.7.5'
+        testInstrumentationRunner 'ru.tubetv.app.PeerTubeFallbackInstrumentation'
+        resourceConfigurations += ['ru']
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        if (releaseKeystorePath) {
+            release {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv('RELEASE_STORE_PASSWORD')
+                keyAlias System.getenv('RELEASE_KEY_ALIAS')
+                keyPassword System.getenv('RELEASE_KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (releaseKeystorePath) {
+                signingConfig = signingConfigs.release
+            }
+            minifyEnabled true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                    '/DebugProbesKt.bin',
+                    '/kotlin/**',
+                    '/META-INF/*.version',
+                    '/META-INF/versions/**',
+                    '/META-INF/version-control-info.textproto'
+            ]
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.17.0'
+    implementation 'androidx.media3:media3-exoplayer:1.10.1'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.10.1'
+    implementation 'androidx.media3:media3-exoplayer-dash:1.10.1'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}

@@ -1,0 +1,740 @@
+package ru.tubetv.app;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+/** Low-priority search and playback support for public videos in the PeerTube federation. */
+final class PeerTubeClient {
+    static final String SOURCE = "PEERTUBE";
+    private static final String USER_AGENT = "0W-Tube/" + BuildConfig.VERSION_NAME + " PeerTube";
+    static final String MEDIA_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 11; Android TV) AppleWebKit/537.36";
+    private static final int MIN_DURATION_SECONDS = PeerTubeSearch.MIN_DURATION_SECONDS;
+    private static final int TIMEOUT_MS = 8_000;
+    private static final int MAX_JSON_BYTES = 1024 * 1024;
+    private static final int MAX_MANIFEST_BYTES = 64 * 1024;
+    private static final int MAX_CACHE_ENTRIES = 32;
+    private static final long CACHE_MS = 10 * 60 * 1000L;
+
+    private static final Set<String> STOP_WORDS = setOf(
+            "а", "без", "в", "во", "для", "до", "за", "и", "из", "или", "к", "ко",
+            "на", "не", "о", "об", "от", "по", "под", "при", "про", "с", "со", "у",
+            "a", "an", "and", "for", "from", "in", "of", "on", "or", "the", "to");
+    private static final Set<String> QUERY_DECORATIONS = setOf(
+            "фильм", "кино", "смотреть", "онлайн", "film", "movie", "online");
+    private static final Set<String> UNWANTED = setOf(
+            "тизер", "трейлер", "обзор", "фрагмент", "отрывок", "реакция", "short",
+            "shorts", "teaser", "trailer", "review", "reaction", "clip");
+    private static final String[] VIDEO_CODECS =
+            {"av01", "avc1", "avc3", "hev1", "hvc1", "theora", "vp8", "vp9", "vp09"};
+    private static final String[] AUDIO_CODECS =
+            {"ac-3", "alac", "ec-3", "flac", "mp4a", "opus", "vorbis"};
+    private static final Map<Character, String> TRANSLIT = transliterationTable();
+    private static final ExpiringCache<String, Media> CACHE = new ExpiringCache<>(MAX_CACHE_ENTRIES, CACHE_MS);
+    private static final TextReader HTTP = PeerTubeClient::getText;
+
+    interface TextReader {
+        String read(String address, int limit, long deadline, Map<String, String> headers) throws Exception;
+    }
+
+    static Map<String, String> apiHeaders() {
+        return requestHeaders(USER_AGENT, "application/json,application/vnd.apple.mpegurl,*/*", null);
+    }
+
+    /** The probe and Media3 must present the same client and video page to the origin/CDN. */
+    static Map<String, String> mediaHeaders(String pageUrl) {
+        return requestHeaders(MEDIA_USER_AGENT, "*/*", pageUrl);
+    }
+
+    private static Map<String, String> requestHeaders(String userAgent, String accept, String pageUrl) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("User-Agent", userAgent);
+        headers.put("Accept", accept);
+        if (pageUrl != null && !pageUrl.isEmpty()) headers.put("Referer", pageUrl);
+        return Collections.unmodifiableMap(headers);
+    }
+
+    static List<VideoItem> search(String query, int minWidth, int thumbnailWidth) throws Exception {
+        return search(query, minWidth, thumbnailWidth, HTTP);
+    }
+
+    static List<VideoItem> search(String query, int minWidth, int thumbnailWidth,
+                                  TextReader reader) throws Exception {
+        String normalized = queryForTitle(query);
+        if (normalized.isEmpty()) return new ArrayList<>();
+        List<String> variants = new ArrayList<>();
+        variants.add(normalized);
+        String latin = transliterate(normalized);
+        if (!latin.isEmpty() && !latin.equals(normalized)) variants.add(latin);
+        return PeerTubeSearch.search(query, variants,
+                (address, deadline) -> new JSONObject(reader.read(address, MAX_JSON_BYTES, deadline, apiHeaders())),
+                (candidate, deadline) -> inspectCandidate(candidate, minWidth, thumbnailWidth, reader, deadline));
+    }
+
+    static VideoItem inspectCandidate(PeerTubeSearch.Candidate candidate, int minWidth,
+                                       int thumbnailWidth, TextReader reader, long deadline) throws Exception {
+        Media media = loadMedia(candidate.apiUrl, false, reader, deadline);
+        if (media.streamUrl == null || media.maxWidth < minWidth) return null;
+        if (media.durationSeconds > 0 && media.durationSeconds < MIN_DURATION_SECONDS) return null;
+        String thumbnail = media.thumbnailFor(thumbnailWidth);
+        if (thumbnail == null) thumbnail = candidate.thumbnail;
+        long duration = media.durationSeconds > 0
+                ? media.durationSeconds * 1000L : candidate.durationSeconds * 1000L;
+        String apiUrl = candidate.apiUrl;
+        String pageUrl = candidate.pageUrl;
+        if (media.uuid != null) {
+            String base = origin(apiUrl);
+            apiUrl = base + "api/v1/videos/" + media.uuid;
+            pageUrl = base + "videos/watch/" + media.uuid;
+        }
+        return new VideoItem(SOURCE, candidate.title, "", thumbnail,
+                apiUrl, pageUrl, duration).withQuality(media.maxWidth, media.maxHeight);
+    }
+
+    static boolean isApiUrl(String value) {
+        if (value == null || !value.contains("/api/v1/videos/")) return false;
+        try {
+            URI uri = URI.create(value);
+            return "https".equalsIgnoreCase(uri.getScheme()) && uri.getHost() != null;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    static PlaybackInfo resolve(String apiUrl, boolean audioOnly, boolean fresh) throws Exception {
+        return resolve(apiUrl, audioOnly, fresh, HTTP);
+    }
+
+    static PlaybackInfo resolve(String apiUrl, boolean audioOnly, boolean fresh,
+                                  TextReader reader) throws Exception {
+        Media media = loadMedia(apiUrl, fresh, reader, Long.MAX_VALUE);
+        if (audioOnly) {
+            if (media.audioUrl == null) {
+                throw new Exception("PeerTube не отдал отдельный или низкокачественный аудиопоток");
+            }
+            return new PlaybackInfo(media.audioUrl, media.audioMimeType,
+                    media.maxWidth, media.maxHeight, media.downloadUrls.get(media.audioUrl));
+        }
+        if (media.streamUrl == null) throw new Exception("PeerTube не отдал воспроизводимый поток");
+        return new PlaybackInfo(media.streamUrl, media.streamMimeType,
+                media.maxWidth, media.maxHeight, media.downloadUrls.get(media.streamUrl));
+    }
+
+    static Evaluation evaluate(String query, String title, int durationSeconds) {
+        if (durationSeconds < MIN_DURATION_SECONDS) return Evaluation.reject();
+        String normalizedQuery = queryForTitle(query);
+        List<String> nativeTitleWords = words(normalize(title));
+        List<String> nativeQueryWords = words(normalizedQuery);
+        for (String word : nativeTitleWords) {
+            if (UNWANTED.contains(word) && !nativeQueryWords.contains(word)) {
+                return Evaluation.reject();
+            }
+        }
+        Evaluation nativeView = evaluateView(normalizedQuery, normalize(title));
+        Evaluation latinView = evaluateView(
+                transliterate(normalizedQuery), transliterate(normalize(title)));
+        return latinView.accepted || latinView.score > nativeView.score ? latinView : nativeView;
+    }
+
+    private static Evaluation evaluateView(String query, String title) {
+        List<String> queryPhrase = words(query);
+        List<String> titlePhrase = words(title);
+        List<String> queryWords = significantWords(queryPhrase);
+        List<String> titleWords = significantWords(titlePhrase);
+        if (queryWords.isEmpty() || titleWords.isEmpty()) return Evaluation.reject();
+
+        for (String word : titleWords) {
+            if (UNWANTED.contains(word) && !queryWords.contains(word)) return Evaluation.reject();
+        }
+
+        int ordered = orderedMatches(queryWords, titleWords);
+        int contiguousStart = contiguousMatchStart(queryPhrase, titlePhrase);
+        boolean contiguous = contiguousStart >= 0;
+        boolean exact = contiguous && queryPhrase.size() == titlePhrase.size();
+        int score = ordered * 5000 / Math.max(1, queryWords.size());
+        if (contiguous) score += 8000;
+        if (exact) score += 8000;
+        score += Math.min(240, titlePhrase.size());
+
+        if (queryWords.size() == 1) {
+            boolean yearSuffix = contiguousStart == 0 && titlePhrase.size() == queryPhrase.size() + 1
+                    && isYear(titlePhrase.get(titlePhrase.size() - 1));
+            return exact || yearSuffix ? Evaluation.accept(score) : Evaluation.reject(score);
+        }
+        boolean titleStart = contiguousStart == 0 || contiguousStart == 1
+                && QUERY_DECORATIONS.contains(titlePhrase.get(0));
+        return contiguous && titleStart
+                ? Evaluation.accept(score) : Evaluation.reject(score);
+    }
+
+    private static int orderedMatches(List<String> query, List<String> title) {
+        int matched = 0;
+        int start = 0;
+        for (String queryWord : query) {
+            for (int i = start; i < title.size(); i++) {
+                if (tokenMatches(queryWord, title.get(i))) {
+                    matched++;
+                    start = i + 1;
+                    break;
+                }
+            }
+        }
+        return matched;
+    }
+
+    private static int contiguousMatchStart(List<String> query, List<String> title) {
+        if (query.isEmpty() || query.size() > title.size()) return -1;
+        for (int start = 0; start <= title.size() - query.size(); start++) {
+            boolean matches = true;
+            for (int offset = 0; offset < query.size(); offset++) {
+                if (!tokenMatches(query.get(offset), title.get(start + offset))) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return start;
+        }
+        return -1;
+    }
+
+    private static boolean tokenMatches(String left, String right) {
+        if (left.equals(right)) return true;
+        int shortest = Math.min(left.length(), right.length());
+        if (shortest < 5) return false;
+        int allowed = Math.max(left.length(), right.length()) <= 8 ? 1 : 2;
+        return editDistance(left, right) <= allowed;
+    }
+
+    private static int editDistance(String left, String right) {
+        if (left.length() < right.length()) {
+            String swap = left;
+            left = right;
+            right = swap;
+        }
+        int[] previous = new int[right.length() + 1];
+        for (int i = 0; i < previous.length; i++) previous[i] = i;
+        for (int i = 1; i <= left.length(); i++) {
+            int[] current = new int[right.length() + 1];
+            current[0] = i;
+            for (int j = 1; j <= right.length(); j++) {
+                int substitution = previous[j - 1]
+                        + (left.charAt(i - 1) == right.charAt(j - 1) ? 0 : 1);
+                current[j] = Math.min(Math.min(current[j - 1] + 1, previous[j] + 1), substitution);
+            }
+            previous = current;
+        }
+        return previous[right.length()];
+    }
+
+    private static Media loadMedia(String apiUrl, boolean fresh, TextReader reader,
+                                    long deadline) throws Exception {
+        if (!isApiUrl(apiUrl)) throw new Exception("Неверный адрес PeerTube");
+        Media cached = fresh || reader != HTTP ? null : CACHE.get(apiUrl);
+        if (cached != null) return cached;
+
+        JSONObject metadata = new JSONObject(reader.read(apiUrl, MAX_JSON_BYTES, deadline, apiHeaders()));
+        String base = origin(apiUrl);
+        String uuid = PeerTubeSearch.canonicalUuid(metadata.optString("uuid"));
+        String path = URI.create(apiUrl).getPath();
+        String id = uuid != null ? uuid : path.substring(path.lastIndexOf('/') + 1);
+        Map<String, String> headers = mediaHeaders(base + "videos/watch/" + id);
+        List<Thumbnail> thumbnails = parseThumbnails(metadata, base);
+        String bestDirectMuxed = null;
+        int bestDirectMuxedHeight = -1;
+        String lowestDirectMuxed = null;
+        int lowestDirectMuxedHeight = Integer.MAX_VALUE;
+        String directAudio = null;
+        long directAudioSize = Long.MAX_VALUE;
+        int maxWidth = 0;
+        int maxHeight = 0;
+
+        JSONArray directFiles = metadata.optJSONArray("files");
+        FileSelection direct = parseFiles(directFiles, base);
+        Map<String, String> downloadUrls = new LinkedHashMap<>(direct.downloadUrls);
+        bestDirectMuxed = direct.bestMuxedUrl;
+        bestDirectMuxedHeight = direct.bestMuxedHeight;
+        lowestDirectMuxed = direct.lowestMuxedUrl;
+        lowestDirectMuxedHeight = direct.lowestMuxedHeight;
+        directAudio = direct.audioUrl;
+        directAudioSize = direct.audioSize;
+        maxWidth = direct.maxWidth;
+        maxHeight = direct.maxHeight;
+
+        String masterUrl = null;
+        HlsInfo bestHls = null;
+        boolean playlistSaysMuxed = false;
+        JSONArray playlists = metadata.optJSONArray("streamingPlaylists");
+        if (playlists != null) {
+            for (int i = 0; i < playlists.length(); i++) {
+                JSONObject playlist = playlists.optJSONObject(i);
+                if (playlist == null) continue;
+                FileSelection files = parseFiles(playlist.optJSONArray("files"), base);
+                downloadUrls.putAll(files.downloadUrls);
+                if (files.maxWidth > maxWidth) {
+                    maxWidth = files.maxWidth;
+                    maxHeight = files.maxHeight;
+                }
+                if (files.bestMuxedUrl != null) {
+                    playlistSaysMuxed = true;
+                    if (bestDirectMuxed == null || files.bestMuxedHeight > bestDirectMuxedHeight) {
+                        bestDirectMuxed = files.bestMuxedUrl;
+                        bestDirectMuxedHeight = files.bestMuxedHeight;
+                    }
+                    if (lowestDirectMuxed == null
+                            || files.lowestMuxedHeight < lowestDirectMuxedHeight) {
+                        lowestDirectMuxed = files.lowestMuxedUrl;
+                        lowestDirectMuxedHeight = files.lowestMuxedHeight;
+                    }
+                }
+                if (files.audioUrl != null && files.audioSize < directAudioSize) {
+                    directAudio = files.audioUrl;
+                    directAudioSize = files.audioSize;
+                }
+                String candidateMaster = httpUrl(playlist.optString("playlistUrl"), base);
+                if (candidateMaster == null) continue;
+                try {
+                    String manifest = reader.read(candidateMaster, MAX_MANIFEST_BYTES, deadline, headers);
+                    HlsInfo info = parseHls(candidateMaster, manifest);
+                    if (!info.valid) continue;
+                    if (masterUrl == null || info.maxWidth > (bestHls == null ? 0 : bestHls.maxWidth)) {
+                        masterUrl = candidateMaster;
+                        bestHls = info;
+                    }
+                } catch (Exception ignored) { }
+            }
+        }
+
+        if (bestHls != null && bestHls.maxWidth > maxWidth) {
+            maxWidth = bestHls.maxWidth;
+            maxHeight = bestHls.maxHeight;
+        }
+        boolean hlsPlayable = bestHls != null
+                && (bestHls.muxed || bestHls.separateAudioUrl != null || playlistSaysMuxed);
+        String streamUrl = hlsPlayable ? masterUrl : bestDirectMuxed;
+        String streamMime = hlsPlayable ? "application/x-mpegURL" : null;
+        String audioUrl = directAudio;
+        String audioMime = directAudio == null ? null : "audio/mp4";
+        if (audioUrl == null && bestHls != null && bestHls.separateAudioUrl != null) {
+            audioUrl = bestHls.separateAudioUrl;
+            audioMime = "application/x-mpegURL";
+        }
+        if (audioUrl == null && bestHls != null && bestHls.lowestMuxedUrl != null) {
+            audioUrl = bestHls.lowestMuxedUrl;
+            audioMime = "application/x-mpegURL";
+        }
+        if (audioUrl == null && lowestDirectMuxed != null) {
+            audioUrl = lowestDirectMuxed;
+            audioMime = null;
+        }
+
+        Media result = new Media(streamUrl, streamMime, audioUrl, audioMime,
+                maxWidth, maxHeight, metadata.optLong("duration"), thumbnails,
+                uuid, downloadUrls);
+        if (reader == HTTP) {
+            CACHE.put(apiUrl, result);
+            if (result.uuid != null) CACHE.put(base + "api/v1/videos/" + result.uuid, result);
+        }
+        return result;
+    }
+
+    private static FileSelection parseFiles(JSONArray files, String base) {
+        FileSelection result = new FileSelection();
+        if (files == null) return result;
+        for (int i = 0; i < files.length(); i++) {
+            JSONObject file = files.optJSONObject(i);
+            if (file == null) continue;
+            String url = httpUrl(file.optString("fileUrl"), base);
+            if (url == null) continue;
+            String download = httpUrl(file.optString("fileDownloadUrl"), base);
+            if (download != null && !download.equals(url)) result.downloadUrls.put(url, download);
+            JSONObject resolution = file.optJSONObject("resolution");
+            int width = Math.max(0, file.optInt("width"));
+            int height = Math.max(0, file.optInt("height"));
+            if (height == 0 && resolution != null) height = Math.max(0, resolution.optInt("id"));
+            if (width == 0 && height > 0) width = Math.round(height * 16f / 9f);
+            if (width > result.maxWidth) {
+                result.maxWidth = width;
+                result.maxHeight = height;
+            }
+            boolean audioLabel = height == 0 || resolution != null
+                    && resolution.optString("label").toLowerCase(Locale.ROOT).contains("audio");
+            boolean hasVideo = file.has("hasVideo") ? file.optBoolean("hasVideo") : !audioLabel;
+            boolean hasAudio = file.has("hasAudio") ? file.optBoolean("hasAudio") : audioLabel;
+            long size = file.optLong("size", Long.MAX_VALUE);
+            if (!hasVideo && hasAudio && size < result.audioSize) {
+                result.audioUrl = url;
+                result.audioSize = size;
+            } else if (hasVideo && hasAudio) {
+                if (height > result.bestMuxedHeight) {
+                    result.bestMuxedUrl = url;
+                    result.bestMuxedHeight = height;
+                }
+                if (height < result.lowestMuxedHeight) {
+                    result.lowestMuxedUrl = url;
+                    result.lowestMuxedHeight = height;
+                }
+            }
+        }
+        return result;
+    }
+
+    static HlsInfo parseHls(String playlistUrl, String manifest) {
+        HlsInfo result = new HlsInfo();
+        result.valid = manifest != null && manifest.trim().startsWith("#EXTM3U");
+        if (!result.valid) return result;
+        Map<String, String> audioGroups = new LinkedHashMap<>();
+        String pending = null;
+        for (String raw : manifest.split("\\r?\\n")) {
+            String line = raw.trim();
+            if (line.startsWith("#EXT-X-MEDIA:")) {
+                String type = hlsAttribute(line, "TYPE");
+                String uri = hlsAttribute(line, "URI");
+                String group = hlsAttribute(line, "GROUP-ID");
+                if ("AUDIO".equalsIgnoreCase(type) && uri != null) {
+                    String resolved = httpUrl(uri, playlistUrl);
+                    if (resolved != null) {
+                        audioGroups.put(group == null ? "" : group, resolved);
+                        if (result.separateAudioUrl == null
+                                || "YES".equalsIgnoreCase(hlsAttribute(line, "DEFAULT"))) {
+                            result.separateAudioUrl = resolved;
+                        }
+                    }
+                }
+            } else if (line.startsWith("#EXT-X-STREAM-INF:")) {
+                pending = line;
+            } else if (pending != null && !line.isEmpty() && !line.startsWith("#")) {
+                String variant = httpUrl(line, playlistUrl);
+                int[] dimensions = dimensions(hlsAttribute(pending, "RESOLUTION"));
+                if (dimensions[0] > result.maxWidth) {
+                    result.maxWidth = dimensions[0];
+                    result.maxHeight = dimensions[1];
+                }
+                String codecs = hlsAttribute(pending, "CODECS");
+                boolean video = dimensions[0] > 0 || containsPrefix(codecs, VIDEO_CODECS);
+                boolean audio = containsPrefix(codecs, AUDIO_CODECS);
+                String audioGroup = hlsAttribute(pending, "AUDIO");
+                if (video && audio) {
+                    result.muxed = true;
+                    if (variant != null && (result.lowestMuxedUrl == null
+                            || dimensions[1] < result.lowestMuxedHeight)) {
+                        result.lowestMuxedUrl = variant;
+                        result.lowestMuxedHeight = dimensions[1];
+                    }
+                }
+                if (video && audioGroup != null && audioGroups.containsKey(audioGroup)) {
+                    result.separateAudioUrl = audioGroups.get(audioGroup);
+                }
+                pending = null;
+            }
+        }
+        return result;
+    }
+
+    private static List<Thumbnail> parseThumbnails(JSONObject metadata, String base) {
+        LinkedHashMap<String, Thumbnail> result = new LinkedHashMap<>();
+        JSONArray values = metadata.optJSONArray("thumbnails");
+        if (values != null) {
+            for (int i = 0; i < values.length(); i++) {
+                JSONObject item = values.optJSONObject(i);
+                if (item == null) continue;
+                String url = httpUrl(item.optString("fileUrl"), base);
+                if (url != null) result.put(url, new Thumbnail(url,
+                        Math.max(0, item.optInt("width")), Math.max(0, item.optInt("height"))));
+            }
+        }
+        addThumbnail(result, metadata.optString("thumbnailPath"), base);
+        addThumbnail(result, metadata.optString("previewPath"), base);
+        return new ArrayList<>(result.values());
+    }
+
+    private static void addThumbnail(Map<String, Thumbnail> values, String path, String base) {
+        String url = httpUrl(path, base);
+        if (url != null && !values.containsKey(url)) values.put(url, new Thumbnail(url, 0, 0));
+    }
+
+    static String getText(String address, int limit, long deadline,
+                          Map<String, String> headers) throws IOException {
+        return ScopedCookies.with(ScopedCookies.NONE, () -> {
+            BoundedHttpReader.checkInterrupted();
+            HttpURLConnection connection = (HttpURLConnection) new URL(address).openConnection();
+            connection.setConnectTimeout(requestTimeout(deadline));
+            connection.setReadTimeout(requestTimeout(deadline));
+            for (Map.Entry<String, String> header : headers.entrySet()) {
+                connection.setRequestProperty(header.getKey(), header.getValue());
+            }
+            try {
+                int code = connection.getResponseCode();
+                if (code < 200 || code >= 300) throw new IOException("PeerTube: HTTP " + code);
+                connection.setReadTimeout(requestTimeout(deadline));
+                return BoundedHttpReader.readText(connection.getInputStream(), limit);
+            } finally {
+                connection.disconnect();
+            }
+        });
+    }
+
+    private static int requestTimeout(long deadline) throws InterruptedIOException {
+        BoundedHttpReader.checkInterrupted();
+        if (deadline == Long.MAX_VALUE) return TIMEOUT_MS;
+        long remaining = (deadline - System.nanoTime()) / 1_000_000L;
+        if (remaining <= 0) throw new InterruptedIOException("Время поиска PeerTube истекло");
+        return (int) Math.min(4_000, remaining);
+    }
+
+    private static String queryForTitle(String value) {
+        List<String> values = words(normalize(value));
+        while (!values.isEmpty()) {
+            String last = values.get(values.size() - 1);
+            if (QUERY_DECORATIONS.contains(last) || isYear(last)) values.remove(values.size() - 1);
+            else break;
+        }
+        return join(values);
+    }
+
+    static String normalize(String value) {
+        if (value == null) return "";
+        value = value.toLowerCase(Locale.ROOT).replace('ё', 'е');
+        StringBuilder result = new StringBuilder(value.length());
+        boolean space = true;
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (Character.isLetterOrDigit(current)) {
+                result.append(current);
+                space = false;
+            } else if (!space) {
+                result.append(' ');
+                space = true;
+            }
+        }
+        int length = result.length();
+        if (length > 0 && result.charAt(length - 1) == ' ') result.setLength(length - 1);
+        return result.toString();
+    }
+
+    static String transliterate(String value) {
+        String normalized = normalize(value);
+        StringBuilder result = new StringBuilder(normalized.length() * 2);
+        for (int i = 0; i < normalized.length(); i++) {
+            char current = normalized.charAt(i);
+            String replacement = TRANSLIT.get(current);
+            result.append(replacement == null ? String.valueOf(current) : replacement);
+        }
+        return normalize(result.toString());
+    }
+
+    private static List<String> words(String value) {
+        List<String> result = new ArrayList<>();
+        if (value == null || value.isEmpty()) return result;
+        for (String word : value.split(" ")) if (!word.isEmpty()) result.add(word);
+        return result;
+    }
+
+    private static List<String> significantWords(List<String> values) {
+        List<String> result = new ArrayList<>();
+        for (String value : values) {
+            if (!STOP_WORDS.contains(value) && value.length() >= 2) result.add(value);
+        }
+        return result.isEmpty() ? values : result;
+    }
+
+    private static String join(List<String> values) {
+        StringBuilder result = new StringBuilder();
+        for (String value : values) {
+            if (result.length() > 0) result.append(' ');
+            result.append(value);
+        }
+        return result.toString();
+    }
+
+    private static boolean isYear(String value) {
+        if (value == null || value.length() != 4) return false;
+        try {
+            int year = Integer.parseInt(value);
+            return year >= 1900 && year <= 2099;
+        } catch (NumberFormatException ignored) {
+            return false;
+        }
+    }
+
+    private static int[] dimensions(String value) {
+        if (value == null) return new int[]{0, 0};
+        int marker = value.indexOf('x');
+        if (marker < 1 || marker >= value.length() - 1) return new int[]{0, 0};
+        try {
+            return new int[]{Integer.parseInt(value.substring(0, marker)),
+                    Integer.parseInt(value.substring(marker + 1))};
+        } catch (NumberFormatException ignored) {
+            return new int[]{0, 0};
+        }
+    }
+
+    private static boolean containsPrefix(String codecs, String[] prefixes) {
+        if (codecs == null) return false;
+        for (String codec : codecs.split(",")) {
+            String value = codec.trim().toLowerCase(Locale.ROOT);
+            for (String prefix : prefixes) if (value.startsWith(prefix)) return true;
+        }
+        return false;
+    }
+
+    private static String hlsAttribute(String line, String name) {
+        String marker = name + "=";
+        int start = line.indexOf(marker);
+        while (start >= 0 && start > 0) {
+            char before = line.charAt(start - 1);
+            if (before == ':' || before == ',') break;
+            start = line.indexOf(marker, start + marker.length());
+        }
+        if (start < 0) return null;
+        start += marker.length();
+        if (start < line.length() && line.charAt(start) == '"') {
+            int end = line.indexOf('"', start + 1);
+            return end > start ? line.substring(start + 1, end) : null;
+        }
+        int end = line.indexOf(',', start);
+        if (end < 0) end = line.length();
+        return line.substring(start, end).trim();
+    }
+
+    private static String origin(String address) throws Exception {
+        URI uri = URI.create(address);
+        if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
+            throw new Exception("Неверный адрес PeerTube");
+        }
+        int port = uri.getPort();
+        return "https://" + uri.getHost() + (port < 0 ? "" : ":" + port) + "/";
+    }
+
+    private static String httpUrl(String value, String base) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            URL resolved = base == null || base.isEmpty() ? new URL(value) : new URL(new URL(base), value);
+            return "https".equalsIgnoreCase(resolved.getProtocol()) ? resolved.toString() : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static Set<String> setOf(String... values) {
+        Set<String> result = new HashSet<>();
+        Collections.addAll(result, values);
+        return Collections.unmodifiableSet(result);
+    }
+
+    private static Map<Character, String> transliterationTable() {
+        Map<Character, String> result = new LinkedHashMap<>();
+        String source = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя";
+        String[] replacements = {"a", "b", "v", "g", "d", "e", "yo", "zh", "z", "i", "y",
+                "k", "l", "m", "n", "o", "p", "r", "s", "t", "u", "f", "kh", "ts", "ch",
+                "sh", "shch", "", "y", "", "e", "yu", "ya"};
+        for (int i = 0; i < source.length(); i++) result.put(source.charAt(i), replacements[i]);
+        return result;
+    }
+
+    static final class Evaluation {
+        final boolean accepted;
+        final int score;
+
+        private Evaluation(boolean accepted, int score) {
+            this.accepted = accepted;
+            this.score = score;
+        }
+
+        static Evaluation accept(int score) { return new Evaluation(true, score); }
+        static Evaluation reject() { return new Evaluation(false, -10_000); }
+        static Evaluation reject(int score) { return new Evaluation(false, score); }
+    }
+
+    static final class HlsInfo {
+        boolean valid;
+        boolean muxed;
+        int maxWidth;
+        int maxHeight;
+        String separateAudioUrl;
+        String lowestMuxedUrl;
+        int lowestMuxedHeight = Integer.MAX_VALUE;
+    }
+
+    private static final class FileSelection {
+        final Map<String, String> downloadUrls = new LinkedHashMap<>();
+        String bestMuxedUrl;
+        int bestMuxedHeight = -1;
+        String lowestMuxedUrl;
+        int lowestMuxedHeight = Integer.MAX_VALUE;
+        String audioUrl;
+        long audioSize = Long.MAX_VALUE;
+        int maxWidth;
+        int maxHeight;
+    }
+
+    private static final class Thumbnail {
+        final String url;
+        final int width;
+        final int height;
+
+        Thumbnail(String url, int width, int height) {
+            this.url = url;
+            this.width = width;
+            this.height = height;
+        }
+    }
+
+    private static final class Media {
+        final String streamUrl;
+        final String streamMimeType;
+        final String audioUrl;
+        final String audioMimeType;
+        final int maxWidth;
+        final int maxHeight;
+        final long durationSeconds;
+        final List<Thumbnail> thumbnails;
+        final String uuid;
+        final Map<String, String> downloadUrls;
+
+        Media(String streamUrl, String streamMimeType, String audioUrl, String audioMimeType,
+              int maxWidth, int maxHeight, long durationSeconds, List<Thumbnail> thumbnails, String uuid,
+              Map<String, String> downloadUrls) {
+            this.streamUrl = streamUrl;
+            this.streamMimeType = streamMimeType;
+            this.audioUrl = audioUrl;
+            this.audioMimeType = audioMimeType;
+            this.maxWidth = maxWidth;
+            this.maxHeight = maxHeight;
+            this.durationSeconds = durationSeconds;
+            this.thumbnails = thumbnails;
+            this.uuid = uuid;
+            this.downloadUrls = Collections.unmodifiableMap(new LinkedHashMap<>(downloadUrls));
+        }
+
+        String thumbnailFor(int targetWidth) {
+            Thumbnail best = null;
+            Thumbnail largest = null;
+            for (Thumbnail candidate : thumbnails) {
+                if (candidate.width <= 0 || candidate.height <= 0
+                        || candidate.width * 10 < candidate.height * 12) continue;
+                if (largest == null || candidate.width > largest.width) largest = candidate;
+                if (candidate.width >= targetWidth
+                        && (best == null || candidate.width < best.width)) best = candidate;
+            }
+            if (best != null) return best.url;
+            if (largest != null) return largest.url;
+            return thumbnails.isEmpty() ? null : thumbnails.get(0).url;
+        }
+    }
+
+    private PeerTubeClient() { }
+}
