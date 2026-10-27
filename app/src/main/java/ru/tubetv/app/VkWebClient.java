@@ -343,7 +343,8 @@ final class VkWebClient {
         java.util.HashMap<String, Integer> ownerCounts = new java.util.HashMap<>();
         while (matcher.find() && ids.size() < CHANNEL_LIMIT * 4) {
             if (ids.add(matcher.group(1) + "_" + matcher.group(2))) {
-                ownerCounts.merge(matcher.group(1), 1, Integer::sum);
+                Integer previous = ownerCounts.get(matcher.group(1));
+                ownerCounts.put(matcher.group(1), previous == null ? 1 : previous + 1);
             }
         }
         // Related-video blocks belong to other owners; keep the channel's own videos.
