@@ -2,8 +2,11 @@ name: Build tagged release
 
 on:
   push:
+    branches:
+      - "**"
     tags:
       - "*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,12 +29,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Verify tag matches the application version
+      - name: Determine release tag
         shell: bash
         run: |
           app_version="$(sed -n "s/.*versionName '\([^']*\)'.*/\1/p" app/build.gradle)"
           test -n "$app_version"
-          test "$app_version" = "$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            test "$app_version" = "$GITHUB_REF_NAME"
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="${app_version}-build.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Install APK packaging tools
         run: |
@@ -56,7 +65,7 @@ jobs:
       - name: Preserve crash symbol mapping
         uses: actions/upload-artifact@v7
         with:
-          name: 0W-Tube-${{ github.ref_name }}-mapping
+          name: 0W-Tube-${{ env.RELEASE_TAG }}-mapping
           path: app/build/outputs/mapping/release/mapping.txt
           if-no-files-found: error
 
@@ -81,9 +90,9 @@ jobs:
           test -x "$apksigner"
 
           mkdir -p dist
-          optimized="$RUNNER_TEMP/0W-Tube-${GITHUB_REF_NAME}-optimized.apk"
-          aligned="$RUNNER_TEMP/0W-Tube-${GITHUB_REF_NAME}-aligned.apk"
-          output="dist/0W-Tube-${GITHUB_REF_NAME}.apk"
+          optimized="$RUNNER_TEMP/0W-Tube-${RELEASE_TAG}-optimized.apk"
+          aligned="$RUNNER_TEMP/0W-Tube-${RELEASE_TAG}-aligned.apk"
+          output="dist/0W-Tube-${RELEASE_TAG}.apk"
 
           cp "$unsigned" "$optimized"
           advzip -z -4 "$optimized"
@@ -110,12 +119,12 @@ jobs:
           unzip -lv "$output" resources.arsc | grep -q 'Stored.*resources.arsc'
 
           cd dist
-          sha256sum "0W-Tube-${GITHUB_REF_NAME}.apk" > "0W-Tube-${GITHUB_REF_NAME}.apk.sha256"
+          sha256sum "0W-Tube-${RELEASE_TAG}.apk" > "0W-Tube-${RELEASE_TAG}.apk.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: 0W-Tube-${{ github.ref_name }}
+          name: 0W-Tube-${{ env.RELEASE_TAG }}
           path: dist/
           if-no-files-found: error
 
@@ -126,14 +135,21 @@ jobs:
         run: |
           set -euo pipefail
           assets=(
-            "dist/0W-Tube-${GITHUB_REF_NAME}.apk"
-            "dist/0W-Tube-${GITHUB_REF_NAME}.apk.sha256"
+            "dist/0W-Tube-${RELEASE_TAG}.apk"
+            "dist/0W-Tube-${RELEASE_TAG}.apk.sha256"
           )
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
-              --verify-tag \
+            prerelease=()
+            case "$RELEASE_TAG" in *-*) prerelease=(--prerelease) ;; esac
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              target=(--verify-tag)
+            else
+              target=(--target "$GITHUB_SHA")
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" "${prerelease[@]}" \
+              "${target[@]}" \
               --generate-notes \
-              --title "0W-Tube ${GITHUB_REF_NAME}"
+              --title "0W-Tube ${RELEASE_TAG}"
           fi

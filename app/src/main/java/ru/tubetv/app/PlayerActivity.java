@@ -61,6 +61,7 @@ public final class PlayerActivity extends Activity {
     private ExoPlayer player;
     private MirrorVideoView videoSurface;
     private ProgressBar loading;
+    private TextView volumeIndicator;
     private SeekBar timeline;
     private TextView message;
     private TextView playState;
@@ -69,6 +70,7 @@ public final class PlayerActivity extends Activity {
     private LinearLayout controls;
     private LinearLayout playbackMenu;
     private LinearLayout mirrorOptions;
+    private TextView backgroundAudioButton;
     private final List<TextView> speedOptions = new ArrayList<>();
     private TextView normalMirrorOption;
     private TextView mirroredOption;
@@ -113,6 +115,14 @@ public final class PlayerActivity extends Activity {
     private VideoItem historyItem;
     private boolean activityStarted;
     private boolean destroyed;
+    private float touchDownX;
+    private float touchDownY;
+    private int gestureStartVolume;
+    private boolean volumeGestureActive;
+    private final Runnable hideVolumeIndicator = () -> {
+        if (volumeIndicator != null) volumeIndicator.animate().alpha(0f).setDuration(180L)
+                .withEndAction(() -> volumeIndicator.setVisibility(View.GONE)).start();
+    };
     private final Runnable openMenuFromLongCenter = () -> {
         if (centerKeyHeld && player != null) {
             centerLongPressTriggered = true;
@@ -173,11 +183,53 @@ public final class PlayerActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         root.setOnTouchListener((view, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                if (playbackMenuVisible) setPlaybackMenuVisible(false);
-                else showControls();
+            AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    touchDownX = event.getX();
+                    touchDownY = event.getY();
+                    gestureStartVolume = audio == null ? 0
+                            : audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+                    volumeGestureActive = false;
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx = event.getX() - touchDownX;
+                    float dy = event.getY() - touchDownY;
+                    if (!volumeGestureActive && touchDownX >= view.getWidth() * 0.55f
+                            && Math.abs(dy) > ViewConfiguration.get(this).getScaledTouchSlop()
+                            && Math.abs(dy) > Math.abs(dx)) {
+                        volumeGestureActive = true;
+                        ui.removeCallbacks(hideVolumeIndicator);
+                        if (volumeIndicator != null) {
+                            volumeIndicator.setAlpha(1f);
+                            volumeIndicator.setVisibility(View.VISIBLE);
+                        }
+                    }
+                    if (volumeGestureActive && audio != null) {
+                        int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                        int delta = Math.round((touchDownY - event.getY())
+                                / Math.max(1f, view.getHeight()) * max * 1.5f);
+                        int target = Math.max(0, Math.min(max, gestureStartVolume + delta));
+                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+                        updateVolumeIndicator(audio);
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (volumeGestureActive) {
+                        ui.removeCallbacks(hideVolumeIndicator);
+                        ui.postDelayed(hideVolumeIndicator, 900L);
+                    } else if (event.getActionMasked() == MotionEvent.ACTION_UP
+                            && Math.abs(event.getX() - touchDownX) < ViewConfiguration.get(this).getScaledTouchSlop()
+                            && Math.abs(event.getY() - touchDownY) < ViewConfiguration.get(this).getScaledTouchSlop()) {
+                        if (playbackMenuVisible) setPlaybackMenuVisible(false);
+                        else showControls();
+                    }
+                    volumeGestureActive = false;
+                    return true;
+                default:
+                    return true;
             }
-            return true;
         });
         videoSurface = new MirrorVideoView(this);
         videoSurface.setMirrored(mirrored);
@@ -206,6 +258,19 @@ public final class PlayerActivity extends Activity {
         message.setPadding(dp(30), dp(20), dp(30), dp(20));
         root.addView(message, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
         message.setText("Получаю видеопоток…");
+
+        volumeIndicator = new TextView(this);
+        volumeIndicator.setTextColor(Color.WHITE);
+        volumeIndicator.setTextSize(18);
+        volumeIndicator.setGravity(Gravity.CENTER);
+        volumeIndicator.setPadding(dp(18), dp(12), dp(18), dp(12));
+        volumeIndicator.setBackgroundResource(R.drawable.player_controls_background);
+        volumeIndicator.setVisibility(View.GONE);
+        volumeIndicator.setAlpha(1f);
+        FrameLayout.LayoutParams volumeParams = new FrameLayout.LayoutParams(
+                dp(104), dp(64), Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        volumeParams.setMargins(0, 0, dp(24), 0);
+        root.addView(volumeIndicator, volumeParams);
 
         controls = new DraggableControlsLayout();
         controls.setOrientation(LinearLayout.VERTICAL);
@@ -328,6 +393,11 @@ public final class PlayerActivity extends Activity {
         }
         menu.addView(speedRow, new LinearLayout.LayoutParams(-1, dp(36)));
 
+        backgroundAudioButton = settingsOption("♫  Проигрывать в фоне");
+        backgroundAudioButton.setOnClickListener(view -> toggleBackgroundAudio());
+        updateBackgroundAudioButton();
+        menu.addView(backgroundAudioButton, new LinearLayout.LayoutParams(-1, dp(36)));
+
         mirrorOptions = new LinearLayout(this);
         mirrorOptions.setGravity(Gravity.CENTER_VERTICAL);
         TextView mirrorTitle = label("Отображение", isCompactPlayer() ? 12 : 14);
@@ -436,6 +506,14 @@ public final class PlayerActivity extends Activity {
     private void restartProgressTicker() {
         ui.removeCallbacks(progressTicker);
         if (activityStarted && player != null && !audioMovedToBackground) ui.post(progressTicker);
+    }
+
+    private void updateVolumeIndicator(AudioManager audio) {
+        if (volumeIndicator == null || audio == null) return;
+        int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+        int current = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        int percent = Math.round(current * 100f / max);
+        volumeIndicator.setText((current == 0 ? "🔇" : "🔊") + "\n" + percent + "%");
     }
 
     private void showControls() {
@@ -624,7 +702,7 @@ public final class PlayerActivity extends Activity {
     }
 
     private int playbackMenuHeightDp() {
-        return audioOnly ? 64 : 102;
+        return audioOnly ? 100 : 138;
     }
 
     private static float normalizedPlaybackSpeed(float speed) {
@@ -935,6 +1013,50 @@ public final class PlayerActivity extends Activity {
             if (keepAudio) startBackgroundAudio();
         }
         super.onStop();
+    }
+
+    private void toggleBackgroundAudio() {
+        if (DeviceType.isTelevision(this)) return;
+        if (audioMovedToBackground) {
+            // Stop background audio and restore video at the service's current position.
+            resumePosition = AudioPlaybackService.takePosition(this, historyItem,
+                    player == null ? resumePosition : player.getCurrentPosition());
+            audioMovedToBackground = false;
+            audioOnly = false;
+            if (videoSurface != null) videoSurface.setVisibility(View.VISIBLE);
+            if (player != null) {
+                player.release();
+                player = null;
+            }
+            updateBackgroundAudioButton();
+            resolveStream();
+            return;
+        }
+        if (player == null || streamUrl == null || !player.isPlaying()) return;
+        resumePosition = player.getCurrentPosition();
+        audioOnly = true;
+        videoSurface.setVisibility(View.INVISIBLE);
+        player.pause();
+        startBackgroundAudio();
+        updateBackgroundAudioButton();
+        if (audioMovedToBackground) {
+            moveTaskToBack(true);
+        } else {
+            audioOnly = false;
+            videoSurface.setVisibility(View.VISIBLE);
+            player.play();
+        }
+    }
+
+    private void updateBackgroundAudioButton() {
+        if (backgroundAudioButton == null) return;
+        backgroundAudioButton.setBackgroundTintList(audioMovedToBackground
+                ? android.content.res.ColorStateList.valueOf(Color.rgb(134, 111, 255))
+                : null);
+        backgroundAudioButton.setTextColor(Color.WHITE);
+        backgroundAudioButton.setContentDescription(audioMovedToBackground
+                ? "Остановить фоновое воспроизведение"
+                : "Проигрывать в фоне");
     }
 
     private void startBackgroundAudio() {

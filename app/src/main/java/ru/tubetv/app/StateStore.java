@@ -59,6 +59,17 @@ final class StateStore {
         prefs(context).edit().putString("screen", "history").apply();
     }
 
+    static void markChannels(Context context, String openChannelUrl) {
+        prefs(context).edit().putString("screen", "channels")
+                .putString("channel_open", openChannelUrl == null ? "" : openChannelUrl).apply();
+    }
+
+    static void setReturnScreen(Context context, String screen) {
+        prefs(context).edit().putString("return_screen", screen).apply();
+    }
+
+    static String openChannel(Context context) { return prefs(context).getString("channel_open", ""); }
+
     static void markReturnScreen(Context context) {
         SharedPreferences preferences = prefs(context);
         preferences.edit().putString("screen",
