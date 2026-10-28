@@ -167,6 +167,8 @@ public final class PlayerActivity extends Activity {
         mirrored = WatchProgressStore.isMirrored(this, videoSource, videoIdentityUrl);
         if (getIntent().getBooleanExtra("resume_background_audio", false)) {
             resumePosition = AudioPlaybackService.takePosition(this, historyItem, resumePosition);
+            // Opening the service notification explicitly returns to video playback.
+            audioOnly = false;
         } else {
             AudioPlaybackService.stopPlayback(this);
         }
@@ -973,16 +975,6 @@ public final class PlayerActivity extends Activity {
     @Override protected void onStart() {
         super.onStart();
         activityStarted = true;
-        if (audioMovedToBackground) {
-            long position = AudioPlaybackService.takePosition(this, historyItem, resumePosition);
-            if (player != null) {
-                player.seekTo(position);
-                player.play();
-            } else {
-                resumePosition = position;
-            }
-            audioMovedToBackground = false;
-        }
         if (player == null && streamUrl != null) startPlayerSafely();
         if (player != null && !player.isPlaying()) showControls();
         restartProgressTicker();
@@ -1095,12 +1087,18 @@ public final class PlayerActivity extends Activity {
             return;
         }
         long position = AudioPlaybackService.takePosition(this, historyItem, resumePosition);
+        resumePosition = position;
+        audioMovedToBackground = false;
+        audioOnly = false;
+        if (videoSurface != null) videoSurface.setVisibility(View.VISIBLE);
         if (player != null) {
             player.seekTo(position);
             player.play();
             showControls();
+        } else {
+            resolveStream();
         }
-        audioMovedToBackground = false;
+        updateBackgroundAudioButton();
     }
 
     @Override protected void onDestroy() {
