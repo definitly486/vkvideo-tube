@@ -61,6 +61,7 @@ public final class PlayerActivity extends Activity {
     private ExoPlayer player;
     private MirrorVideoView videoSurface;
     private ProgressBar loading;
+    private TextView volumeIndicator;
     private SeekBar timeline;
     private TextView message;
     private TextView playState;
@@ -113,6 +114,15 @@ public final class PlayerActivity extends Activity {
     private VideoItem historyItem;
     private boolean activityStarted;
     private boolean destroyed;
+    private float touchDownX;
+    private float touchDownY;
+    private float lastVolumeGestureY;
+    private int gestureStartVolume;
+    private boolean volumeGestureActive;
+    private final Runnable hideVolumeIndicator = () -> {
+        if (volumeIndicator != null) volumeIndicator.animate().alpha(0f).setDuration(180L)
+                .withEndAction(() -> volumeIndicator.setVisibility(View.GONE)).start();
+    };
     private final Runnable openMenuFromLongCenter = () -> {
         if (centerKeyHeld && player != null) {
             centerLongPressTriggered = true;
@@ -173,11 +183,55 @@ public final class PlayerActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         root.setOnTouchListener((view, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                if (playbackMenuVisible) setPlaybackMenuVisible(false);
-                else showControls();
+            AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    touchDownX = event.getX();
+                    touchDownY = event.getY();
+                    lastVolumeGestureY = touchDownY;
+                    gestureStartVolume = audio == null ? 0
+                            : audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+                    volumeGestureActive = false;
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx = event.getX() - touchDownX;
+                    float dy = event.getY() - touchDownY;
+                    if (!volumeGestureActive && touchDownX >= view.getWidth() * 0.55f
+                            && Math.abs(dy) > ViewConfiguration.get(this).getScaledTouchSlop()
+                            && Math.abs(dy) > Math.abs(dx)) {
+                        volumeGestureActive = true;
+                        ui.removeCallbacks(hideVolumeIndicator);
+                        if (volumeIndicator != null) {
+                            volumeIndicator.setAlpha(1f);
+                            volumeIndicator.setVisibility(View.VISIBLE);
+                        }
+                    }
+                    if (volumeGestureActive && audio != null) {
+                        int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                        int delta = Math.round((touchDownY - event.getY())
+                                / Math.max(1f, view.getHeight()) * max * 1.5f);
+                        int target = Math.max(0, Math.min(max, gestureStartVolume + delta));
+                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+                        lastVolumeGestureY = event.getY();
+                        updateVolumeIndicator(audio);
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (volumeGestureActive) {
+                        ui.removeCallbacks(hideVolumeIndicator);
+                        ui.postDelayed(hideVolumeIndicator, 900L);
+                    } else if (event.getActionMasked() == MotionEvent.ACTION_UP
+                            && Math.abs(event.getX() - touchDownX) < ViewConfiguration.get(this).getScaledTouchSlop()
+                            && Math.abs(event.getY() - touchDownY) < ViewConfiguration.get(this).getScaledTouchSlop()) {
+                        if (playbackMenuVisible) setPlaybackMenuVisible(false);
+                        else showControls();
+                    }
+                    volumeGestureActive = false;
+                    return true;
+                default:
+                    return true;
             }
-            return true;
         });
         videoSurface = new MirrorVideoView(this);
         videoSurface.setMirrored(mirrored);
@@ -206,6 +260,19 @@ public final class PlayerActivity extends Activity {
         message.setPadding(dp(30), dp(20), dp(30), dp(20));
         root.addView(message, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
         message.setText("Получаю видеопоток…");
+
+        volumeIndicator = new TextView(this);
+        volumeIndicator.setTextColor(Color.WHITE);
+        volumeIndicator.setTextSize(18);
+        volumeIndicator.setGravity(Gravity.CENTER);
+        volumeIndicator.setPadding(dp(18), dp(12), dp(18), dp(12));
+        volumeIndicator.setBackgroundResource(R.drawable.player_controls_background);
+        volumeIndicator.setVisibility(View.GONE);
+        volumeIndicator.setAlpha(1f);
+        FrameLayout.LayoutParams volumeParams = new FrameLayout.LayoutParams(
+                dp(104), dp(64), Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        volumeParams.setMargins(0, 0, dp(24), 0);
+        root.addView(volumeIndicator, volumeParams);
 
         controls = new DraggableControlsLayout();
         controls.setOrientation(LinearLayout.VERTICAL);
@@ -436,6 +503,14 @@ public final class PlayerActivity extends Activity {
     private void restartProgressTicker() {
         ui.removeCallbacks(progressTicker);
         if (activityStarted && player != null && !audioMovedToBackground) ui.post(progressTicker);
+    }
+
+    private void updateVolumeIndicator(AudioManager audio) {
+        if (volumeIndicator == null || audio == null) return;
+        int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+        int current = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        int percent = Math.round(current * 100f / max);
+        volumeIndicator.setText((current == 0 ? "🔇" : "🔊") + "\\n" + percent + "%");
     }
 
     private void showControls() {
