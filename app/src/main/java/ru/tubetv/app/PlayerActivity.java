@@ -70,6 +70,7 @@ public final class PlayerActivity extends Activity {
     private LinearLayout controls;
     private LinearLayout playbackMenu;
     private LinearLayout mirrorOptions;
+    private TextView backgroundAudioButton;
     private final List<TextView> speedOptions = new ArrayList<>();
     private TextView normalMirrorOption;
     private TextView mirroredOption;
@@ -392,17 +393,10 @@ public final class PlayerActivity extends Activity {
         }
         menu.addView(speedRow, new LinearLayout.LayoutParams(-1, dp(36)));
 
-        TextView backgroundAudio = settingsOption("♫  Проигрывать в фоне");
-        backgroundAudio.setOnClickListener(view -> {
-            if (DeviceType.isTelevision(PlayerActivity.this) || player == null
-                    || streamUrl == null || !player.isPlaying()) return;
-            audioOnly = true;
-            videoSurface.setVisibility(View.INVISIBLE);
-            player.pause();
-            startBackgroundAudio();
-            moveTaskToBack(true);
-        });
-        menu.addView(backgroundAudio, new LinearLayout.LayoutParams(-1, dp(36)));
+        backgroundAudioButton = settingsOption("♫  Проигрывать в фоне");
+        backgroundAudioButton.setOnClickListener(view -> toggleBackgroundAudio());
+        updateBackgroundAudioButton();
+        menu.addView(backgroundAudioButton, new LinearLayout.LayoutParams(-1, dp(36)));
 
         mirrorOptions = new LinearLayout(this);
         mirrorOptions.setGravity(Gravity.CENTER_VERTICAL);
@@ -1019,6 +1013,50 @@ public final class PlayerActivity extends Activity {
             if (keepAudio) startBackgroundAudio();
         }
         super.onStop();
+    }
+
+    private void toggleBackgroundAudio() {
+        if (DeviceType.isTelevision(this)) return;
+        if (audioMovedToBackground) {
+            // Stop background audio and restore video at the service's current position.
+            resumePosition = AudioPlaybackService.takePosition(this, historyItem,
+                    player == null ? resumePosition : player.getCurrentPosition());
+            audioMovedToBackground = false;
+            audioOnly = false;
+            if (videoSurface != null) videoSurface.setVisibility(View.VISIBLE);
+            if (player != null) {
+                player.release();
+                player = null;
+            }
+            updateBackgroundAudioButton();
+            resolveStream();
+            return;
+        }
+        if (player == null || streamUrl == null || !player.isPlaying()) return;
+        resumePosition = player.getCurrentPosition();
+        audioOnly = true;
+        videoSurface.setVisibility(View.INVISIBLE);
+        player.pause();
+        startBackgroundAudio();
+        updateBackgroundAudioButton();
+        if (audioMovedToBackground) {
+            moveTaskToBack(true);
+        } else {
+            audioOnly = false;
+            videoSurface.setVisibility(View.VISIBLE);
+            player.play();
+        }
+    }
+
+    private void updateBackgroundAudioButton() {
+        if (backgroundAudioButton == null) return;
+        backgroundAudioButton.setBackgroundTintList(audioMovedToBackground
+                ? android.content.res.ColorStateList.valueOf(Color.rgb(134, 111, 255))
+                : null);
+        backgroundAudioButton.setTextColor(Color.WHITE);
+        backgroundAudioButton.setContentDescription(audioMovedToBackground
+                ? "Остановить фоновое воспроизведение"
+                : "Проигрывать в фоне");
     }
 
     private void startBackgroundAudio() {
