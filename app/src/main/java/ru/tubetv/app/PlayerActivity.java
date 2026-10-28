@@ -392,6 +392,18 @@ public final class PlayerActivity extends Activity {
         }
         menu.addView(speedRow, new LinearLayout.LayoutParams(-1, dp(36)));
 
+        TextView backgroundAudio = settingsOption("♫  Проигрывать в фоне");
+        backgroundAudio.setOnClickListener(view -> {
+            if (DeviceType.isTelevision(PlayerActivity.this) || player == null
+                    || streamUrl == null || !player.isPlaying()) return;
+            audioOnly = true;
+            videoSurface.setVisibility(View.INVISIBLE);
+            player.pause();
+            startBackgroundAudio();
+            moveTaskToBack(true);
+        });
+        menu.addView(backgroundAudio, new LinearLayout.LayoutParams(-1, dp(36)));
+
         mirrorOptions = new LinearLayout(this);
         mirrorOptions.setGravity(Gravity.CENTER_VERTICAL);
         TextView mirrorTitle = label("Отображение", isCompactPlayer() ? 12 : 14);
@@ -696,7 +708,7 @@ public final class PlayerActivity extends Activity {
     }
 
     private int playbackMenuHeightDp() {
-        return audioOnly ? 64 : 102;
+        return audioOnly ? 100 : 138;
     }
 
     private static float normalizedPlaybackSpeed(float speed) {
