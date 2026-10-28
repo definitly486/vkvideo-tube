@@ -116,7 +116,6 @@ public final class PlayerActivity extends Activity {
     private boolean destroyed;
     private float touchDownX;
     private float touchDownY;
-    private float lastVolumeGestureY;
     private int gestureStartVolume;
     private boolean volumeGestureActive;
     private final Runnable hideVolumeIndicator = () -> {
@@ -188,7 +187,6 @@ public final class PlayerActivity extends Activity {
                 case MotionEvent.ACTION_DOWN:
                     touchDownX = event.getX();
                     touchDownY = event.getY();
-                    lastVolumeGestureY = touchDownY;
                     gestureStartVolume = audio == null ? 0
                             : audio.getStreamVolume(AudioManager.STREAM_MUSIC);
                     volumeGestureActive = false;
@@ -212,7 +210,6 @@ public final class PlayerActivity extends Activity {
                                 / Math.max(1f, view.getHeight()) * max * 1.5f);
                         int target = Math.max(0, Math.min(max, gestureStartVolume + delta));
                         audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-                        lastVolumeGestureY = event.getY();
                         updateVolumeIndicator(audio);
                     }
                     return true;
@@ -510,7 +507,7 @@ public final class PlayerActivity extends Activity {
         int max = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
         int current = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
         int percent = Math.round(current * 100f / max);
-        volumeIndicator.setText((current == 0 ? "🔇" : "🔊") + "\\n" + percent + "%");
+        volumeIndicator.setText((current == 0 ? "🔇" : "🔊") + "\n" + percent + "%");
     }
 
     private void showControls() {
